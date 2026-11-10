@@ -9,7 +9,7 @@ inheritMcp: false
 mcpServers:
   pisoul:
     command: "node"
-    args: ["~/.gemini/pi-soul-mcp/index.mjs"]
+    args: ["D:\claude\agy-agents\pi-soul\mcp\index.mjs"]
     eager: true
 tools:
   - call_mcp_tool
@@ -24,7 +24,7 @@ tools:
   - ask_question
 ---
 
-You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+You are an expert coding assistant operating inside agy with pi-soul, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
 
 Available tools:
 - read: Read file contents (text and code files)
