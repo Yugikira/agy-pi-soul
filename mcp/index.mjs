@@ -107,31 +107,32 @@ const codemodeTool = {
 };
 
 // 4. 动态加载 Skills 摘要（同时兼容 AGY 和 Pi 的技能目录），pi-soul的agent定义里 inheritCustomizations:true，skill加载可以交由agy来实现。
-// function getSkillsAppendix() {
-//   try {
-//     // 尝试调用 Pi 原生的 loadSkills 或读取常见技能目录
-//     const skillsResult = loadSkills({
-//       cwd,
-//       agentDir: join(homedir(), ".gemini", "antigravity"),
-//       skillPaths: [
-//         join(cwd, ".agents", "skills"),
-//         join(cwd, ".agent", "skills"),
-//         join(homedir(), ".gemini", "antigravity", "skills"),
-//       ],
-//     });
-//     const skills = Array.isArray(skillsResult)
-//       ? skillsResult
-//       : skillsResult?.skills || [];
-//     if (skills.length === 0) return "";
-//
-//     const lines = skills.map(
-//       (s) => `- ${s.name}: ${s.description} (Location: ${s.filePath})`
-//     );
-//     return `\n\n<available_skills>\nWhen a task matches a skill below, use \`read\` to load its SKILL.md first:\n${lines.join("\n")}\n</available_skills>`;
-//   } catch {
-//     return "";
-//   }
-// }
+function getSkillsAppendix() {
+  return "";
+  // try {
+  //   // 尝试调用 Pi 原生的 loadSkills 或读取常见技能目录
+  //   const skillsResult = loadSkills({
+  //     cwd,
+  //     agentDir: join(homedir(), ".gemini", "antigravity"),
+  //     skillPaths: [
+  //       join(cwd, ".agents", "skills"),
+  //       join(cwd, ".agent", "skills"),
+  //       join(homedir(), ".gemini", "antigravity", "skills"),
+  //     ],
+  //   });
+  //   const skills = Array.isArray(skillsResult)
+  //     ? skillsResult
+  //     : skillsResult?.skills || [];
+  //   if (skills.length === 0) return "";
+  //
+  //   const lines = skills.map(
+  //     (s) => `- ${s.name}: ${s.description} (Location: ${s.filePath})`
+  //   );
+  //   return `\n\n<available_skills>\nWhen a task matches a skill below, use \`read\` to load its SKILL.md first:\n${lines.join("\n")}\n</available_skills>`;
+  // } catch {
+  //   return "";
+  // }
+}
 
 const allTools = { ...piTools, codemode: codemodeTool };
 
