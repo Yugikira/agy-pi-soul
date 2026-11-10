@@ -126,7 +126,8 @@ test("P2-8: codemode sandbox executes subcalls and respects declarations", async
 
     const result = await codemodeTool.execute("call_1", { code });
     assert.equal(result.isError ?? false, false);
-    assert.ok(result.content[0].text.includes("created from codemode"));
+    const text = result.content.map((block) => (block.type === "text" ? block.text : "")).join("\n");
+    assert.ok(text.includes("created from codemode"));
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }

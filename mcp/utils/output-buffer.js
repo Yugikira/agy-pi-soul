@@ -8,6 +8,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
+import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "./truncate.js";
@@ -115,6 +116,42 @@ export class OutputBuffer {
   /** Bytes of the line being written, for the "line is X" truncation hint. */
   getLastLineBytes() {
     return this.currentLineBytes;
+  }
+
+  /**
+   * The complete output, for programmatic callers (codemode scripts) that can take more than the
+   * display snapshot. Call after finish() and close(). Output longer than `maxBytes` keeps its first
+   * and last `maxBytes / 2` bytes around an omission marker.
+   */
+  async readFullOutput(maxBytes) {
+    if (!this.tempFilePath) {
+      return { content: new TextDecoder().decode(Buffer.concat(this.rawChunks)), truncated: false };
+    }
+    const file = await open(this.tempFilePath, "r");
+    try {
+      const size = (await file.stat()).size;
+      if (size <= maxBytes) {
+        return { content: new TextDecoder().decode(await file.readFile()), truncated: false };
+      }
+      const headBytes = Math.floor(maxBytes / 2);
+      const tailBytes = maxBytes - headBytes;
+      const head = Buffer.alloc(headBytes);
+      const tail = Buffer.alloc(tailBytes);
+      await file.read(head, 0, headBytes, 0);
+      await file.read(tail, 0, tailBytes, size - tailBytes);
+      // Cut at character boundaries: streaming decode holds back an incomplete trailing sequence,
+      // and the tail skips leading continuation bytes.
+      const headText = new TextDecoder().decode(head, { stream: true });
+      let tailStart = 0;
+      while (tailStart < tail.length && (tail[tailStart] & 0xc0) === 0x80) {
+        tailStart++;
+      }
+      const tailText = new TextDecoder().decode(tail.subarray(tailStart));
+      const omitted = size - headBytes - tailBytes;
+      return { content: `${headText}\n\n[... ${omitted} bytes omitted ...]\n\n${tailText}`, truncated: true };
+    } finally {
+      await file.close();
+    }
   }
 
   appendDecodedText(text) {

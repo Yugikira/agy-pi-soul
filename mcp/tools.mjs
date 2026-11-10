@@ -1,4 +1,10 @@
-import { CodemodeSandbox } from "@earendil-works/pi-codemode";
+import {
+  CodemodeSandbox,
+  parseCodemodeSource,
+  renderDeclarations,
+  renderToolSample,
+} from "@earendil-works/pi-codemode";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
@@ -24,6 +30,8 @@ export const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
+/** Output limit of `structuredContent.output`, which codemode scripts receive. */
+const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
 
 export { resolvePath, normalizePath, withFileMutationQueue };
 
@@ -110,6 +118,22 @@ export const readTool = {
       },
     },
   },
+  // Mirrors pi's read output: programmatic callers (codemode scripts) get the text, or an image block.
+  outputSchema: {
+    anyOf: [
+      { type: "string" },
+      {
+        type: "object",
+        required: ["type", "data", "mimeType", "note"],
+        properties: {
+          type: { type: "string", const: "image" },
+          data: { type: "string" },
+          mimeType: { type: "string" },
+          note: { type: "string" },
+        },
+      },
+    ],
+  },
   async execute(_id, params) {
     const fullPath = resolvePath(params.path);
     try {
@@ -126,30 +150,30 @@ export const readTool = {
 
       if (imageMimeType) {
         if (stat.size > MAX_IMAGE_BYTES) {
+          const note =
+            `Read image file [${imageMimeType}]\n` +
+            `[Image omitted: ${formatSize(stat.size)} exceeds the ${formatSize(MAX_IMAGE_BYTES)} inline image size limit. Use bash to inspect or convert it.]`;
           return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `Read image file [${imageMimeType}]\n` +
-                  `[Image omitted: ${formatSize(stat.size)} exceeds the ${formatSize(MAX_IMAGE_BYTES)} inline image size limit. Use bash to inspect or convert it.]`,
-              },
-            ],
+            content: [{ type: "text", text: note }],
+            structuredContent: note,
           };
         }
         const buffer = await fs.readFile(fullPath);
+        const note = `Read image file [${imageMimeType}]`;
+        const data = buffer.toString("base64");
         return {
           content: [
             {
               type: "text",
-              text: `Read image file [${imageMimeType}]`,
+              text: note,
             },
             {
               type: "image",
-              data: buffer.toString("base64"),
+              data,
               mimeType: imageMimeType,
             },
           ],
+          structuredContent: { type: "image", data, mimeType: imageMimeType, note },
         };
       }
 
@@ -212,6 +236,7 @@ export const readTool = {
 
       return {
         content: [{ type: "text", text: outputText }],
+        structuredContent: outputText,
       };
     } catch (err) {
       return {
@@ -390,6 +415,18 @@ export const bashTool = {
       },
     },
   },
+  // Mirrors pi's bash output: codemode scripts get the exit code and the (up to 1MB) full output.
+  outputSchema: {
+    type: "object",
+    required: ["output", "truncated", "exit_code", "wall_time_seconds"],
+    properties: {
+      output: { type: "string", description: "Combined stdout and stderr, possibly truncated" },
+      truncated: { type: "boolean" },
+      full_output_path: { type: "string", description: "Full output, when truncated" },
+      exit_code: { type: "number" },
+      wall_time_seconds: { type: "number" },
+    },
+  },
   async execute(_id, params, signal) {
     if (params.timeout !== undefined) {
       if (typeof params.timeout !== "number" || !Number.isFinite(params.timeout) || params.timeout <= 0) {
@@ -428,6 +465,7 @@ export const bashTool = {
     }
 
     return new Promise((resolve) => {
+      const startedAt = performance.now();
       // Bounded memory: full output streams to a temp file once it outgrows the inline limits.
       const output = new OutputBuffer({ tempFilePrefix: "pi-bash" });
       let timedOut = false;
@@ -478,7 +516,7 @@ export const bashTool = {
       child.stdout?.on("data", onData);
       child.stderr?.on("data", onData);
 
-      const finish = async (statusText, emptyText, isError) => {
+      const finish = async (statusText, emptyText, isError, exit) => {
         if (settled) {
           return;
         }
@@ -491,6 +529,24 @@ export const bashTool = {
         const truncation = snapshot.truncation;
         const lastLineBytes = output.getLastLineBytes();
         await output.close().catch(() => {});
+
+        // The value a codemode script receives: like pi, only for a normal exit (timeouts and
+        // aborts reject there, so they must not resolve to a value here either).
+        let structuredContent;
+        if (exit) {
+          const fullOutput = await output
+            .readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES)
+            .catch(() => ({ content: "", truncated: false }));
+          structuredContent = {
+            output: fullOutput.content,
+            truncated: fullOutput.truncated,
+            ...(fullOutput.truncated && snapshot.fullOutputPath
+              ? { full_output_path: snapshot.fullOutputPath }
+              : {}),
+            exit_code: exit.exitCode,
+            wall_time_seconds: exit.wallTimeSeconds,
+          };
+        }
 
         let text = snapshot.content || emptyText;
         let details;
@@ -514,11 +570,13 @@ export const bashTool = {
         resolve({
           content: [{ type: "text", text: finalText }],
           ...(details ? { details } : {}),
+          ...(structuredContent ? { structuredContent } : {}),
           isError,
         });
       };
 
       child.on("close", async (code, signalName) => {
+        const wallTimeSeconds = Math.round((performance.now() - startedAt) / 100) / 10;
         if (timedOut) {
           await finish(`Command timed out after ${timeoutSec} seconds`, "", true);
           return;
@@ -529,17 +587,12 @@ export const bashTool = {
         }
         // A signal-killed shell has no exit code. Use the standard shell convention so callers
         // do not mistake the termination for a successful command.
-        let resolvedCode = code;
-        if (resolvedCode === null && signalName) {
-          resolvedCode = 128 + (os.constants.signals[signalName] ?? 0);
-        }
-        if (resolvedCode === null) {
-          await finish("Command terminated without an exit code", "(no output)", true);
-        } else if (resolvedCode !== 0) {
-          await finish(`Command exited with code ${resolvedCode}`, "(no output)", true);
-        } else {
-          await finish("", "(no output)", false);
-        }
+        const resolvedCode = code ?? (signalName ? 128 + (os.constants.signals[signalName] ?? 0) : 1);
+        const isError = resolvedCode !== 0;
+        await finish(isError ? `Command exited with code ${resolvedCode}` : "", "(no output)", isError, {
+          exitCode: resolvedCode,
+          wallTimeSeconds,
+        });
       });
 
       child.on("error", async (err) => {
@@ -567,6 +620,218 @@ export const piTools = {
   bash: bashTool,
 };
 
+// 5. codemode tool (pi-compatible: declared tools, outputSchema values, // @options, bounded output)
+
+const CODEMODE_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024;
+const CODEMODE_DEFAULT_TIMEOUT_MS = 300_000;
+const CODEMODE_DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
+const CODEMODE_CHARS_PER_TOKEN = 4;
+
+const IMAGE_EXTENSIONS = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/gif": ".gif",
+  "image/webp": ".webp",
+};
+
+/** `description` + signature, the shape pi uses for sandbox tool descriptions and ALL_TOOLS. */
+function codemodeToolSample(tool) {
+  return renderToolSample({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.parameters,
+    outputSchema: tool.outputSchema,
+  });
+}
+
+const CODEMODE_TOOL_DECLARATIONS = renderDeclarations({
+  tools: Object.values(piTools).map((tool) => ({
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.parameters,
+    outputSchema: tool.outputSchema,
+  })),
+});
+
+/** Like the script's `text()`: strings as is, other values as JSON. */
+function valueText(value) {
+  if (typeof value === "string") return value;
+  return JSON.stringify(value) ?? String(value);
+}
+/**
+ * Lay out the script's output so the model can tell items apart. With more than one text item
+ * (`text()` or the returned value), each starts with a `==> text N/M <==` line. `console.*` lines
+ * follow all other output in one `<console_output>` block.
+ */
+function formatCodemodeOutput(output) {
+  const total = output.filter((item) => item.type === "text" && !item.console).length;
+  const items = [];
+  const consoleLines = [];
+  let index = 0;
+  for (const item of output) {
+    if (item.type === "image") {
+      items.push(item);
+    } else if (item.console) {
+      consoleLines.push(item.text);
+    } else {
+      index++;
+      items.push({
+        type: "text",
+        text: total > 1 ? `==> text ${index}/${total} <==\n${item.text}` : item.text,
+      });
+    }
+  }
+  if (consoleLines.length > 0) {
+    items.push({ type: "text", text: `<console_output>\n${consoleLines.join("\n")}\n</console_output>` });
+  }
+  return items;
+}
+/** Join adjacent text items into one, each part starting on its own line. */
+function joinAdjacentText(items) {
+  const joined = [];
+  let parts = [];
+  let lastPart = "";
+  const flush = () => {
+    if (parts.length > 0) joined.push({ type: "text", text: parts.join("") });
+    parts = [];
+    lastPart = "";
+  };
+  for (const item of items) {
+    if (item.type !== "text") {
+      flush();
+      joined.push(item);
+      continue;
+    }
+    if (lastPart !== "" && !lastPart.endsWith("\n")) {
+      parts.push("\n");
+      lastPart = "\n";
+    }
+    parts.push(item.text);
+    if (item.text !== "") lastPart = item.text;
+  }
+  flush();
+  return joined;
+}
+function formatCallSummary(calls) {
+  if (calls.length === 0) return "No tool calls were made.";
+  return `Tool calls made before the failure (they are not undone): ${calls
+    .map((call) => `${call.name} (${call.status})`)
+    .join(", ")}`;
+}
+function formatCodemodeError(result) {
+  const { error } = result;
+  const head =
+    error.kind === "script"
+      ? (error.stack ?? `${error.name ?? "Error"}: ${error.message}`)
+      : error.kind === "timeout"
+        ? `Script timed out: ${error.message}`
+        : error.kind === "aborted"
+          ? `Script aborted: ${error.message}`
+          : `Script sandbox failed: ${error.message}`;
+  return `${head}\n\n${formatCallSummary(result.calls ?? [])}`;
+}
+/** Output can carry private data, so only the user may read these files. */
+async function writeOutputFile(prefix, extension, data) {
+  const filePath = path.join(os.tmpdir(), `${prefix}-${randomBytes(8).toString("hex")}${extension}`);
+  // `wx` never follows a link someone else placed at the path.
+  await fs.writeFile(filePath, data, { mode: 0o600, flag: "wx" });
+  return filePath;
+}
+/** Write the full text output to a temp file, like bash does for truncated output. */
+async function spillCodemodeOutput(text) {
+  try {
+    return { path: await writeOutputFile("pi-codemode", ".txt", text) };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+/**
+ * Save each image to a temp file and put a text item with its path before it: scripts cannot write
+ * files, so this is how the model can reach the bytes later. Images shown more than once are saved once.
+ */
+async function saveCodemodeImages(items) {
+  const labels = new Map();
+  const label = async ({ data, mimeType }) => {
+    const bytes = Buffer.from(data, "base64");
+    const kind = `${mimeType}, ${formatSize(bytes.length)}`;
+    const extension = IMAGE_EXTENSIONS[mimeType];
+    if (!extension) {
+      throw new Error(`No file extension for image type ${mimeType}`);
+    }
+    try {
+      const filePath = await writeOutputFile("pi-codemode", extension, bytes);
+      return `[Image saved to ${filePath} (${kind})]`;
+    } catch (error) {
+      return `[Image (${kind}) could not be saved: ${error instanceof Error ? error.message : String(error)}]`;
+    }
+  };
+  const result = await Promise.all(
+    items.map(async (item) => {
+      if (item.type !== "image") return [item];
+      let pending = labels.get(item.data);
+      if (!pending) {
+        pending = label(item);
+        labels.set(item.data, pending);
+      }
+      return [{ type: "text", text: await pending }, item];
+    })
+  );
+  return result.flat();
+}
+/** Returns at most the first `maxUnits` UTF-16 code units of `text`, without splitting a surrogate pair. */
+function sliceHead(text, maxUnits) {
+  const end = Math.max(0, maxUnits);
+  return isHighSurrogate(text.charCodeAt(end - 1)) && isLowSurrogate(text.charCodeAt(end))
+    ? text.slice(0, end - 1)
+    : text.slice(0, end);
+}
+/** Returns at most the last `maxUnits` UTF-16 code units of `text`, without splitting a surrogate pair. */
+function sliceTail(text, maxUnits) {
+  if (maxUnits <= 0) return "";
+  const start = Math.max(0, text.length - maxUnits);
+  return isLowSurrogate(text.charCodeAt(start)) && isHighSurrogate(text.charCodeAt(start - 1))
+    ? text.slice(start + 1)
+    : text.slice(start);
+}
+function isHighSurrogate(code) {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+function isLowSurrogate(code) {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+/**
+ * Apply the token budget: when the combined text exceeds it, the text items become one item that
+ * keeps the start and end of the text, images follow it, and the full text is written to a temp file.
+ */
+async function truncateCodemodeOutput(items, maxTokens) {
+  const texts = items.filter((item) => item.type === "text").map((item) => item.text);
+  const combined = texts.join("\n");
+  const budget = maxTokens * CODEMODE_CHARS_PER_TOKEN;
+  if (texts.length === 0 || combined.length <= budget) {
+    return { items };
+  }
+  const headChars = Math.floor(budget / 2);
+  const tailChars = budget - headChars;
+  const removed = combined.length - headChars - tailChars;
+  const head = sliceHead(combined, headChars);
+  const tail = sliceTail(combined, tailChars);
+  let text = `Warning: truncated output (original token count: ${Math.ceil(
+    combined.length / CODEMODE_CHARS_PER_TOKEN
+  )})\nTotal output lines: ${combined.split("\n").length}\n\n${head}…${Math.ceil(
+    removed / CODEMODE_CHARS_PER_TOKEN
+  )} tokens truncated…${tail}`;
+  const spilled = await spillCodemodeOutput(combined);
+  text +=
+    "path" in spilled
+      ? `\n\n[Full output: ${spilled.path} (read with offset/limit)]`
+      : `\n\n[Could not save the full output: ${spilled.error}]`;
+  return {
+    items: [{ type: "text", text }, ...items.filter((item) => item.type === "image")],
+    ...("path" in spilled ? { fullOutputPath: spilled.path } : {}),
+  };
+}
+
+/** Fallback for results without a structured value: text blocks joined, or the image block. */
 export function extractCodemodeResult(res) {
   if (!res || !Array.isArray(res.content)) return typeof res === "string" ? res : JSON.stringify(res);
   const imageItem = res.content.find((c) => c.type === "image");
@@ -584,13 +849,17 @@ export function extractCodemodeResult(res) {
     .join("\n");
 }
 
-// 5. codemode tool (with inputSchema + proper subtool error throwing + image support)
 export const codemodeTool = {
   name: "codemode",
   description:
-    "Execute a JavaScript async function body inside an isolated QuickJS sandbox with direct access to `tools.read`, `tools.write`, `tools.edit`, and `tools.bash`. " +
+    "Execute a JavaScript async function body inside an isolated QuickJS sandbox with direct access to the tools below. " +
     "Nested tool calls inside codemode never bloat the LLM context—only what you pass to `text(...)`, `console.log(...)`, or `return` is returned. " +
-    "Use this whenever chaining multiple searches (e.g., `rg`), reading multiple files, filtering output, or performing batch edits.",
+    "Use this whenever chaining multiple searches (e.g., `rg`), reading multiple files, filtering output, or performing batch edits. " +
+    "Scripts may start with an options line, e.g. `// @options: {\"max_output_tokens\": 2000, \"timeout_ms\": 30000}`. " +
+    "`ALL_TOOLS` lists every nested tool.\n\n" +
+    "Declared tools:\n```ts\n" +
+    CODEMODE_TOOL_DECLARATIONS +
+    "\n```",
   parameters: {
     type: "object",
     required: ["code"],
@@ -605,51 +874,84 @@ export const codemodeTool = {
     },
   },
   async execute(_id, params, signal) {
+    if (typeof params.code !== "string") {
+      return {
+        content: [{ type: "text", text: "Invalid codemode input: 'code' must be a string." }],
+        isError: true,
+      };
+    }
+
+    const startedAt = performance.now();
+    let parsed;
+    try {
+      parsed = parseCodemodeSource(params.code);
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Codemode Error (source): ${err.message}` }],
+        isError: true,
+      };
+    }
+    const { code, options } = parsed;
+
     const sandbox = new CodemodeSandbox({
-      timeoutMs: 120_000,
-      tools: Object.values(piTools).map((t) => ({
-        name: t.name,
-        description: t.description,
-        inputSchema: t.parameters,
-        execute: async (args, { signal: sbSignal }) => {
-          const res = await t.execute("codemode-subcall", args, sbSignal ?? signal);
-          const val = extractCodemodeResult(res);
-          if (res && res.isError) {
-            throw new Error(typeof val === "string" ? val : JSON.stringify(val));
+      timeoutMs: options.timeoutMs ?? CODEMODE_DEFAULT_TIMEOUT_MS,
+      memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES,
+      tools: Object.values(piTools).map((tool) => ({
+        name: tool.name,
+        description: codemodeToolSample(tool),
+        inputSchema: tool.parameters,
+        outputSchema: tool.outputSchema,
+        execute: async (args, { signal: callSignal }) => {
+          const res = await tool.execute("codemode-subcall", args, callSignal ?? signal);
+          // Like pi: a tool that declares an output schema resolves to its structured value, also
+          // for error results that carry one (such as a non-zero bash exit code).
+          if (tool.outputSchema && res.structuredContent !== undefined) {
+            return res.structuredContent;
           }
-          return val;
+          const value = extractCodemodeResult(res);
+          if (res.isError) {
+            throw new Error(typeof value === "string" ? value : JSON.stringify(value));
+          }
+          return value;
         },
       })),
     });
 
+    let result;
     try {
-      const result = await sandbox.execute(params.code);
-      const logs = (result.output || [])
-        .map((item) => (item.type === "text" ? item.text : JSON.stringify(item)))
-        .join("\n");
-
-      if (!result.ok) {
-        const errText = `Codemode Error (${result.error?.kind}): ${result.error?.message}`;
-        return {
-          content: [{ type: "text", text: logs ? `${logs}\n${errText}` : errText }],
-          isError: true,
-        };
-      }
-
-      const finalValue =
-        result.value !== undefined
-          ? typeof result.value === "string"
-            ? result.value
-            : JSON.stringify(result.value, null, 2)
-          : "";
-
-      const combined = [logs, finalValue].filter(Boolean).join("\n");
-      return {
-        content: [{ type: "text", text: combined || "(Executed successfully with no output)" }],
-      };
+      result = await sandbox.execute(code, { signal });
     } finally {
       await sandbox.close();
     }
+
+    // Calls still marked running were cut off by the script ending, a timeout, or an abort.
+    for (const call of result.calls ?? []) {
+      if (call.status === "running") call.status = "cancelled";
+    }
+
+    const scriptOutput = [...result.output];
+    if (result.ok && result.value !== undefined) {
+      scriptOutput.push({ type: "text", text: valueText(result.value) });
+    }
+    const items = formatCodemodeOutput(scriptOutput);
+    if (!result.ok) {
+      items.push({ type: "text", text: `Script error:\n${formatCodemodeError(result)}` });
+    }
+
+    const truncated = await truncateCodemodeOutput(
+      joinAdjacentText(items),
+      options.maxOutputTokens ?? CODEMODE_DEFAULT_MAX_OUTPUT_TOKENS
+    );
+    // After truncation, which moves images after the text, so each saved path stays next to its image.
+    const output = joinAdjacentText(await saveCodemodeImages(truncated.items));
+    const wallTime = ((performance.now() - startedAt) / 1000).toFixed(1);
+    const header = `${result.ok ? "Script completed" : "Script failed"}\nWall time ${wallTime} seconds\nOutput:\n`;
+
+    return {
+      content: [{ type: "text", text: header }, ...output],
+      ...(truncated.fullOutputPath ? { details: { fullOutputPath: truncated.fullOutputPath } } : {}),
+      ...(result.ok ? {} : { isError: true }),
+    };
   },
 };
 
