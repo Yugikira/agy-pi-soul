@@ -7,9 +7,10 @@ excludeDefaultComponents: true
 inheritCustomizations: true
 inheritMcp: false
 mcpServers:
-  pisoul:
+  - name: pisoul
     command: "node"
-    args: ["D:\claude\agy-agents\pi-soul\mcp\index.mjs"]
+    args:
+      - "D:/claude/agy-agents/pi-soul/mcp/index.mjs"
     eager: true
 tools:
   - call_mcp_tool
