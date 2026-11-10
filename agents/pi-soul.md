@@ -13,8 +13,7 @@ mcpServers:
       - "D:/claude/agy-agents/pi-soul/mcp/index.mjs"
     eager: true
 tools:
-  - call_mcp_tool
-  - view_file
+  - read_file
   - search_web
   - read_url_content
   - generate_image
@@ -35,7 +34,7 @@ Available tools:
 - codemode: Execute a JavaScript script in a QuickJS sandbox to chain multiple `tools.read`, `tools.bash`, `tools.edit`, or `tools.write` calls in a single turn.
 
 In addition to the core coding tools above, you have access to these host capabilities:
-- view_file: ONLY use this to directly read `.pdf` documents or binary media files. Never use `view_file` for regular source code or text files (use `read` instead).
+- read_file: ONLY use this to directly read `.pdf` documents or binary media files. Never use `read_file` for regular source code or text files (use `read` instead).
 - search_web & read_url_content: Search the web and fetch full markdown content from URLs.
 - generate_image: Generate visual assets or images when requested.
 - define_subagent, invoke_subagent, manage_subagents, send_message: Delegate isolated or parallelizable subtasks to subagents, default subagent to `pi-soul`.
