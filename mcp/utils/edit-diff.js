@@ -410,7 +410,7 @@ export function applyEditsToNormalizedContent(normalizedContent, edits, filePath
 
   for (let i = 0; i < normalizedEdits.length; i++) {
     if (normalizedEdits[i].oldText.length === 0) {
-      throw new Error(`oldText must not be empty${filePath ? ` in ${filePath}` : ""}.`);
+      throw new Error(getEmptyOldTextError(filePath, i, normalizedEdits.length));
     }
   }
 
@@ -423,17 +423,11 @@ export function applyEditsToNormalizedContent(normalizedContent, edits, filePath
     const edit = normalizedEdits[i];
     const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
     if (!matchResult.found) {
-      const errPrefix = normalizedEdits.length === 1
-        ? `Could not find exact match for 'oldText'${filePath ? ` in ${filePath}` : ""}:\n${edit.oldText}`
-        : `Could not find edits[${i}]${filePath ? ` in ${filePath}` : ""}:\n${edit.oldText}`;
-      throw new Error(errPrefix);
+      throw new Error(getNotFoundError(filePath, i, normalizedEdits.length));
     }
     const occurrences = countOccurrences(replacementBaseContent, edit.oldText);
     if (occurrences > 1) {
-      const errPrefix = normalizedEdits.length === 1
-        ? `Found ${occurrences} occurrences of 'oldText'${filePath ? ` in ${filePath}` : ""}. The text must be unique. Please provide more context to disambiguate:\n${edit.oldText}`
-        : `Found ${occurrences} occurrences of edits[${i}]${filePath ? ` in ${filePath}` : ""}. Each oldText must be unique. Please provide more context to disambiguate:\n${edit.oldText}`;
-      throw new Error(errPrefix);
+      throw new Error(getDuplicateError(filePath, i, normalizedEdits.length, occurrences));
     }
     matchedEdits.push({
       editIndex: i,
@@ -448,7 +442,9 @@ export function applyEditsToNormalizedContent(normalizedContent, edits, filePath
     const prev = matchedEdits[i - 1];
     const curr = matchedEdits[i];
     if (prev.matchIndex + prev.matchLength > curr.matchIndex) {
-      throw new Error(`Overlapping edits detected between edit[${prev.editIndex}] and edit[${curr.editIndex}]. Merge nearby edits into a single block.`);
+      throw new Error(
+        `edits[${prev.editIndex}] and edits[${curr.editIndex}] overlap in ${filePath}. Merge them into one edit or target disjoint regions.`
+      );
     }
   }
 
@@ -459,8 +455,36 @@ export function applyEditsToNormalizedContent(normalizedContent, edits, filePath
 
   const newContent = applyReplacements(baseContent, replacements);
   if (baseContent === newContent) {
-    throw new Error(`Replacement produced identical content${filePath ? ` for ${filePath}` : ""}. No changes made.`);
+    throw new Error(getNoChangeError(filePath, normalizedEdits.length));
   }
 
   return { baseContent, newContent, replacements };
+}
+
+function getNotFoundError(filePath, editIndex, totalEdits) {
+  if (totalEdits === 1) {
+    return `Could not find the exact text in ${filePath}. The old text must match exactly including all whitespace and newlines.`;
+  }
+  return `Could not find edits[${editIndex}] in ${filePath}. The oldText must match exactly including all whitespace and newlines.`;
+}
+
+function getDuplicateError(filePath, editIndex, totalEdits, occurrences) {
+  if (totalEdits === 1) {
+    return `Found ${occurrences} occurrences of the text in ${filePath}. The text must be unique. Please provide more context to make it unique.`;
+  }
+  return `Found ${occurrences} occurrences of edits[${editIndex}] in ${filePath}. Each oldText must be unique. Please provide more context to make it unique.`;
+}
+
+function getEmptyOldTextError(filePath, editIndex, totalEdits) {
+  if (totalEdits === 1) {
+    return `oldText must not be empty in ${filePath}.`;
+  }
+  return `edits[${editIndex}].oldText must not be empty in ${filePath}.`;
+}
+
+function getNoChangeError(filePath, totalEdits) {
+  if (totalEdits === 1) {
+    return `No changes made to ${filePath}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.`;
+  }
+  return `No changes made to ${filePath}. The replacements produced identical content.`;
 }

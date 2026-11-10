@@ -20,7 +20,13 @@ import {
 } from "./utils/edit-diff.js";
 import { resolvePath, normalizePath } from "./utils/paths.js";
 import { withFileMutationQueue } from "./utils/mutation-queue.js";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "./utils/truncate.js";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "./utils/truncate.js";
+import {
+  isStreamableRange,
+  readLocalFileChunks,
+  selectLinesFromBuffer,
+  selectLinesFromStream,
+} from "./utils/read-lines.js";
 import { detectSupportedImageMimeTypeFromFile } from "./utils/mime.js";
 import { OutputBuffer } from "./utils/output-buffer.js";
 
@@ -34,6 +40,13 @@ const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
 
 export { resolvePath, normalizePath, withFileMutationQueue };
+
+/** Throw when the caller aborted, so long operations can stop between filesystem steps. */
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw new Error("Operation aborted");
+  }
+}
 
 function findExecutableOnPath(executable) {
   if (process.platform === "win32") {
@@ -134,9 +147,14 @@ export const readTool = {
       },
     ],
   },
-  async execute(_id, params) {
+  async execute(_id, params, signal) {
     const fullPath = resolvePath(params.path);
     try {
+      if (signal?.aborted) {
+        throw new Error("Operation aborted");
+      }
+      // Same preflight as pi: a missing or unreadable file reports the raw fs error.
+      await fs.access(fullPath, fsSync.constants.R_OK);
       const stat = await fs.stat(fullPath);
       if (stat.isDirectory()) {
         return {
@@ -177,21 +195,18 @@ export const readTool = {
         };
       }
 
-      // Read text file (splitting on \n keeps the \r of CRLF files)
-      const raw = await fs.readFile(fullPath, "utf-8");
-      const allLines = raw.split("\n");
-      const totalFileLines = allLines.length;
-
       // Convert offset from 1-indexed input to 0-indexed line access, like pi.
       const startLine = params.offset ? Math.max(0, params.offset - 1) : 0;
       const startLineDisplay = startLine + 1;
-      const endLine =
-        params.limit === undefined ? undefined : Math.min(startLine + params.limit, allLines.length);
-      // truncateHead ignores a trailing empty line, so a file ending in a newline is not truncated early.
-      const truncation = truncateHead(allLines.slice(startLine, endLine).join("\n"));
-      const firstLineBytes = truncation.firstLineExceedsLimit
-        ? Buffer.byteLength(allLines[Math.trunc(startLine)] ?? "", "utf-8")
-        : 0;
+      // Stream normal ranges so memory stays flat; fractional/negative ranges keep pi's buffer slicing.
+      const { totalFileLines, truncation, firstLineBytes } = isStreamableRange(params.offset, params.limit)
+        ? await selectLinesFromStream(
+            readLocalFileChunks(fullPath, { signal }),
+            startLine,
+            params.limit,
+            signal
+          )
+        : selectLinesFromBuffer(await fs.readFile(fullPath), startLine, params.limit);
 
       if (startLine >= totalFileLines) {
         return {
@@ -240,7 +255,7 @@ export const readTool = {
       };
     } catch (err) {
       return {
-        content: [{ type: "text", text: `Error reading file: ${err.message}` }],
+        content: [{ type: "text", text: err.message }],
         isError: true,
       };
     }
@@ -266,11 +281,15 @@ export const writeTool = {
       },
     },
   },
-  async execute(_id, params) {
+  async execute(_id, params, signal) {
     const fullPath = resolvePath(params.path);
     return withFileMutationQueue(fullPath, async () => {
       try {
+        // Check the signal instead of rejecting from an abort listener: the queue must stay locked
+        // until the in-flight filesystem operation has settled.
+        throwIfAborted(signal);
         await fs.mkdir(path.dirname(fullPath), { recursive: true });
+        throwIfAborted(signal);
         await fs.writeFile(fullPath, params.content, "utf-8");
         return {
           content: [
@@ -282,7 +301,7 @@ export const writeTool = {
         };
       } catch (err) {
         return {
-          content: [{ type: "text", text: `Error writing file: ${err.message}` }],
+          content: [{ type: "text", text: err.message }],
           isError: true,
         };
       }
@@ -308,14 +327,15 @@ export const editTool = {
       edits: {
         type: "array",
         description:
-          "One or more targeted replacements. Each edit is matched against the original file, not incrementally.",
+          "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
         items: {
           type: "object",
           required: ["oldText", "newText"],
           properties: {
             oldText: {
               type: "string",
-              description: "Exact text for one targeted replacement. It must be unique in the original file.",
+              description:
+                "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call.",
             },
             newText: {
               type: "string",
@@ -324,20 +344,22 @@ export const editTool = {
           },
         },
       },
+      // Compatibility aliases for models that send one edit instead of an edits array.
       oldText: {
         type: "string",
-        description: "Exact text to find (if passing a single edit directly)",
+        description: "Exact text to find (compatibility alias for a single edit, use edits instead)",
       },
       newText: {
         type: "string",
-        description: "Replacement text (if passing a single edit directly)",
+        description: "Replacement text (compatibility alias for a single edit, use edits instead)",
       },
     },
   },
-  async execute(_id, params) {
+  async execute(_id, params, signal) {
     const fullPath = resolvePath(params.path);
     return withFileMutationQueue(fullPath, async () => {
       try {
+        throwIfAborted(signal);
         let edits = params.edits;
         if (typeof edits === "string") {
           try {
@@ -356,12 +378,28 @@ export const editTool = {
 
         if (edits.length === 0) {
           return {
-            content: [{ type: "text", text: "Error: Either 'edits' array or 'oldText'/'newText' must be provided." }],
+            content: [
+              {
+                type: "text",
+                text: "Edit tool input is invalid. edits must contain at least one replacement.",
+              },
+            ],
             isError: true,
           };
         }
 
+        // Same preflight as pi: report a missing or read-only file before reading, with the error code.
+        try {
+          await fs.access(fullPath, fsSync.constants.R_OK | fsSync.constants.W_OK);
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
+          throw new Error(`Could not edit file: ${params.path}. ${errorMessage}.`);
+        }
+        throwIfAborted(signal);
+
         const rawContent = await fs.readFile(fullPath, "utf-8");
+        throwIfAborted(signal);
         const { bom, text: content } = splitBom(rawContent);
         const normalizedOriginal = normalizeToLF(content);
 
@@ -380,13 +418,14 @@ export const editTool = {
           : applyReplacementsToOriginal(content, replacements));
 
         await fs.writeFile(fullPath, finalContent, "utf-8");
+        throwIfAborted(signal);
         return {
           content: [{ type: "text", text: `Successfully replaced ${edits.length} block(s) in ${params.path}.` }],
           details: editDiff,
         };
       } catch (err) {
         return {
-          content: [{ type: "text", text: `Error editing file: ${err.message}` }],
+          content: [{ type: "text", text: err.message }],
           isError: true,
         };
       }
@@ -887,7 +926,7 @@ export const codemodeTool = {
       parsed = parseCodemodeSource(params.code);
     } catch (err) {
       return {
-        content: [{ type: "text", text: `Codemode Error (source): ${err.message}` }],
+        content: [{ type: "text", text: err.message }],
         isError: true,
       };
     }
@@ -956,6 +995,33 @@ export const codemodeTool = {
 };
 
 export const allTools = { ...piTools, codemode: codemodeTool };
+
+const REQUIRED_TOOL_ARGUMENTS = {
+  read: { path: "string" },
+  write: { path: "string", content: "string" },
+  edit: { path: "string" },
+  bash: { command: "string" },
+  codemode: { code: "string" },
+};
+
+/**
+ * pi validates tool input in its agent loop; an MCP client is not required to. Without this,
+ * a missing argument reaches `resolvePath` or `spawn` as `undefined` and produces confusing
+ * filesystem or shell errors, so check the required fields here instead.
+ */
+export function validateToolArguments(toolName, args) {
+  const required = REQUIRED_TOOL_ARGUMENTS[toolName];
+  if (!required) {
+    return null;
+  }
+  const value = args && typeof args === "object" ? args : {};
+  for (const [field, type] of Object.entries(required)) {
+    if (typeof value[field] !== type) {
+      return `Invalid ${toolName} input: '${field}' must be a ${type}.`;
+    }
+  }
+  return null;
+}
 
 /**
  * Map a tool result to an MCP CallToolResult. The model-facing content is unchanged;

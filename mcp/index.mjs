@@ -4,7 +4,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { allTools, toCallToolResult } from "./tools.mjs";
+import { allTools, toCallToolResult, validateToolArguments } from "./tools.mjs";
 
 export { allTools };
 
@@ -35,6 +35,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   }
 
   const args = request.params.arguments ?? {};
+  const argumentError = validateToolArguments(toolName, args);
+  if (argumentError) {
+    return toCallToolResult({
+      content: [{ type: "text", text: argumentError }],
+      isError: true,
+    });
+  }
+
   const result = await tool.execute(
     `call_${Date.now()}`,
     args,

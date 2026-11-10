@@ -67,7 +67,17 @@ Through the local stdio MCP server (`mcp/index.mjs`), Pi's battle-tested primiti
 - `read`: Read files cleanly with optional start line and limit.
 - `write`: Create or overwrite files cleanly.
 - `edit`: Pi's signature surgical replacement. Requires exact unique text matches to prevent accidental overwrites. Like Pi, it reports a diff of the change; since MCP has no `details` field, it travels in `_meta["pisoul/toolDetails"]` as `{ diff, patch, firstChangedLine }` and never reaches the model.
-- `codemode`: Powered by `@earendil-works/pi-codemode` inside a QuickJS WebAssembly sandbox. Lets the model chain loops of `tools.bash`, `tools.read`, and `tools.edit` in a single interaction without bloating context tokens.
+- `codemode`: Powered by `@earendil-works/pi-codemode` inside a QuickJS WebAssembly sandbox. Lets the model chain loops of `tools.bash`, `tools.read`, and `tools.edit` in a single interaction without bloating context tokens. Nested tools are declared with their signatures, `bash` resolves to a structured `{ output, exit_code, … }` value, scripts may set a `// @options:` deadline, and the VM runs with pi's 256MB memory limit.
+
+#### Parity notes (vs. `pi-coding-agent`)
+
+The five tools follow pi's behaviour: identical descriptions and input schemas, the same 2000-line/50KB truncation with continuation notices, image detection by file content, `edit`'s matching/fuzzy/line-ending rules and error texts, bounded `bash` output, and the `codemode` sandbox semantics above.
+
+Deliberate differences:
+
+- `read` on a directory answers "`<path>` is a directory, not a file." instead of Node's raw `EISDIR` error.
+- Images are not resized (no image dependency added); files above 5MB are reported as an omitted image with a note instead of being sent inline.
+- `bash` inherits the MCP server's environment as is; pi's `PI_*` session variables only exist inside pi itself.
 
 ### 3. Clear Tool Separation of Concerns
 To avoid model confusion, tool responsibilities are strictly separated:
