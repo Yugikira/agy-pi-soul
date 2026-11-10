@@ -10,7 +10,7 @@ import {
   normalizeToLF,
   applyReplacementsToOriginal,
   applyEditsToNormalizedContent,
-  generateUnifiedPatch,
+  generateEditDiff,
 } from "./utils/edit-diff.js";
 import { resolvePath, normalizePath } from "./utils/paths.js";
 import { withFileMutationQueue } from "./utils/mutation-queue.js";
@@ -343,23 +343,24 @@ export const editTool = {
         const { bom, text: content } = splitBom(rawContent);
         const normalizedOriginal = normalizeToLF(content);
 
-        const { newContent, replacements } = applyEditsToNormalizedContent(
+        const { baseContent, newContent, replacements } = applyEditsToNormalizedContent(
           normalizedOriginal,
           edits,
           params.path
         );
+
+        // Diff only around the replacements (same content the edit was computed on), before writing.
+        const editDiff = generateEditDiff(params.path, baseContent, newContent, replacements);
 
         // Restore line endings: untouched lines keep original line endings
         const finalContent = bom + (content === normalizedOriginal
           ? newContent
           : applyReplacementsToOriginal(content, replacements));
 
-        const editDiff = generateUnifiedPatch(params.path, rawContent, finalContent);
-
         await fs.writeFile(fullPath, finalContent, "utf-8");
         return {
           content: [{ type: "text", text: `Successfully replaced ${edits.length} block(s) in ${params.path}.` }],
-          details: { diff: editDiff },
+          details: editDiff,
         };
       } catch (err) {
         return {
@@ -624,3 +625,19 @@ export const codemodeTool = {
 };
 
 export const allTools = { ...piTools, codemode: codemodeTool };
+
+/**
+ * Map a tool result to an MCP CallToolResult. The model-facing content is unchanged;
+ * result details (for example the edit diff) ride along in `_meta` for display clients
+ * such as agy, which decodes `_meta` but is free to ignore unknown keys.
+ */
+export function toCallToolResult(result) {
+  const response = {
+    content: result.content,
+    isError: result.isError ?? false,
+  };
+  if (result.details !== undefined) {
+    response._meta = { "pisoul/toolDetails": result.details };
+  }
+  return response;
+}

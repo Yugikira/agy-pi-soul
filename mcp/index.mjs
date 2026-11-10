@@ -4,7 +4,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { allTools } from "./tools.mjs";
+import { allTools, toCallToolResult } from "./tools.mjs";
 
 export { allTools };
 
@@ -41,10 +41,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     extra.signal
   );
 
-  return {
-    content: result.content,
-    isError: result.isError ?? false,
-  };
+  return toCallToolResult(result);
 });
 
 const transport = new StdioServerTransport();

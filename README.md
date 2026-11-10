@@ -66,7 +66,7 @@ Through the local stdio MCP server (`mcp/index.mjs`), Pi's battle-tested primiti
 - `bash`: Runs inside Git Bash (`C:\Program Files\Git\bin\bash.exe`). No PowerShell quirks, full POSIX pipeline support.
 - `read`: Read files cleanly with optional start line and limit.
 - `write`: Create or overwrite files cleanly.
-- `edit`: Pi's signature surgical replacement. Requires exact unique text matches to prevent accidental overwrites.
+- `edit`: Pi's signature surgical replacement. Requires exact unique text matches to prevent accidental overwrites. Like Pi, it reports a diff of the change; since MCP has no `details` field, it travels in `_meta["pisoul/toolDetails"]` as `{ diff, patch, firstChangedLine }` and never reaches the model.
 - `codemode`: Powered by `@earendil-works/pi-codemode` inside a QuickJS WebAssembly sandbox. Lets the model chain loops of `tools.bash`, `tools.read`, and `tools.edit` in a single interaction without bloating context tokens.
 
 ### 3. Clear Tool Separation of Concerns
