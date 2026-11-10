@@ -60,14 +60,17 @@ test("P1-2: editTool handles special spaces (NBSP) in fuzzy match", async () => 
   }
 });
 
-test("P1-4: readTool returns text note with image and blocks oversized images", async () => {
+test("P1-4: readTool returns text note with image and notes oversized images", async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-soul-test-"));
   const imgFile = path.join(tmpDir, "test.png");
   const bigImgFile = path.join(tmpDir, "huge.png");
 
   try {
-    // Normal small image
-    const smallBuffer = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    // 1x1 transparent PNG (detection is by content, not by extension)
+    const smallBuffer = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+      "base64"
+    );
     await fs.writeFile(imgFile, smallBuffer);
 
     const result = await readTool.execute("call_1", { path: imgFile });
@@ -78,14 +81,14 @@ test("P1-4: readTool returns text note with image and blocks oversized images", 
     assert.equal(result.content[1].type, "image");
     assert.equal(result.content[1].mimeType, "image/png");
 
-    // Oversized image (6MB > 5MB limit)
-    const bigBuffer = Buffer.alloc(6 * 1024 * 1024);
+    // Oversized image (6MB > 5MB limit): a note, not a tool error, so the model can fall back to bash
+    const bigBuffer = Buffer.concat([smallBuffer, Buffer.alloc(6 * 1024 * 1024)]);
     await fs.writeFile(bigImgFile, bigBuffer);
 
     const bigResult = await readTool.execute("call_2", { path: bigImgFile });
-    assert.equal(bigResult.isError, true);
+    assert.equal(bigResult.isError ?? false, false);
     assert.equal(bigResult.content.length, 1);
-    assert.match(bigResult.content[0].text, /exceeds the 5\.0MB limit/);
+    assert.match(bigResult.content[0].text, /\[Image omitted: 6\.0MB exceeds the 5\.0MB inline image size limit/);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
@@ -120,4 +123,8 @@ test("P2-4: bashTool validates timeout parameters and rejects invalid values", a
   const resNaN = await bashTool.execute("call_3", { command: "echo ok", timeout: "abc" });
   assert.equal(resNaN.isError, true);
   assert.equal(resNaN.content[0].text, "Invalid timeout: must be a finite number of seconds");
+
+  const resTooLarge = await bashTool.execute("call_4", { command: "echo ok", timeout: 1e9 });
+  assert.equal(resTooLarge.isError, true);
+  assert.equal(resTooLarge.content[0].text, "Invalid timeout: maximum is 2147483.647 seconds");
 });

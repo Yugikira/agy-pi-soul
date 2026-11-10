@@ -14,10 +14,16 @@ import {
 } from "./utils/edit-diff.js";
 import { resolvePath, normalizePath } from "./utils/paths.js";
 import { withFileMutationQueue } from "./utils/mutation-queue.js";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "./utils/truncate.js";
+import { detectSupportedImageMimeTypeFromFile } from "./utils/mime.js";
+import { OutputBuffer } from "./utils/output-buffer.js";
 
-export const MAX_OUTPUT_BYTES = 50 * 1024; // 50KB
-export const MAX_OUTPUT_LINES = 2000;
+export const MAX_OUTPUT_BYTES = DEFAULT_MAX_BYTES; // 50KB
+export const MAX_OUTPUT_LINES = DEFAULT_MAX_LINES;
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB
+
+const MAX_TIMEOUT_MS = 2_147_483_647;
+const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 
 export { resolvePath, normalizePath, withFileMutationQueue };
 
@@ -115,26 +121,20 @@ export const readTool = {
         };
       }
 
-      const ext = path.extname(fullPath).toLowerCase();
-      const imageMimeTypes = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-        ".bmp": "image/bmp",
-      };
+      // Image detection uses the file content, not the extension: a .png that is not a PNG is text.
+      const imageMimeType = await detectSupportedImageMimeTypeFromFile(fullPath).catch(() => null);
 
-      if (imageMimeTypes[ext]) {
+      if (imageMimeType) {
         if (stat.size > MAX_IMAGE_BYTES) {
           return {
             content: [
               {
                 type: "text",
-                text: `Image file ${params.path} (${formatSize(stat.size)}) exceeds the ${formatSize(MAX_IMAGE_BYTES)} limit. Please resize or inspect it using bash/scripts.`,
+                text:
+                  `Read image file [${imageMimeType}]\n` +
+                  `[Image omitted: ${formatSize(stat.size)} exceeds the ${formatSize(MAX_IMAGE_BYTES)} inline image size limit. Use bash to inspect or convert it.]`,
               },
             ],
-            isError: true,
           };
         }
         const buffer = await fs.readFile(fullPath);
@@ -142,75 +142,72 @@ export const readTool = {
           content: [
             {
               type: "text",
-              text: `Read image file [${imageMimeTypes[ext]}]`,
+              text: `Read image file [${imageMimeType}]`,
             },
             {
               type: "image",
               data: buffer.toString("base64"),
-              mimeType: imageMimeTypes[ext],
+              mimeType: imageMimeType,
             },
           ],
         };
       }
 
-      // Read text file (splitting on \n preserves \r on CRLF files)
+      // Read text file (splitting on \n keeps the \r of CRLF files)
       const raw = await fs.readFile(fullPath, "utf-8");
-      const lines = raw.split("\n");
-      const totalLines = lines.length;
+      const allLines = raw.split("\n");
+      const totalFileLines = allLines.length;
 
-      const offset = params.offset && params.offset > 0 ? Math.floor(params.offset) : 1;
-      if (offset > totalLines) {
+      // Convert offset from 1-indexed input to 0-indexed line access, like pi.
+      const startLine = params.offset ? Math.max(0, params.offset - 1) : 0;
+      const startLineDisplay = startLine + 1;
+      const endLine =
+        params.limit === undefined ? undefined : Math.min(startLine + params.limit, allLines.length);
+      // truncateHead ignores a trailing empty line, so a file ending in a newline is not truncated early.
+      const truncation = truncateHead(allLines.slice(startLine, endLine).join("\n"));
+      const firstLineBytes = truncation.firstLineExceedsLimit
+        ? Buffer.byteLength(allLines[Math.trunc(startLine)] ?? "", "utf-8")
+        : 0;
+
+      if (startLine >= totalFileLines) {
         return {
           content: [
             {
               type: "text",
-              text: `Error: Offset ${offset} is beyond end of file (${totalLines} lines total).`,
+              text: `Offset ${params.offset} is beyond end of file (${totalFileLines} lines total)`,
             },
           ],
           isError: true,
         };
       }
 
-      const startIdx = offset - 1;
-      const maxRequestedLines =
-        params.limit && params.limit > 0 ? Math.floor(params.limit) : MAX_OUTPUT_LINES;
+      // A user-specified limit is honored before truncation.
+      const userLimitedLines =
+        params.limit === undefined
+          ? undefined
+          : Math.min(startLine + params.limit, totalFileLines) - startLine;
 
-      const firstLineBytes = Buffer.byteLength(lines[startIdx] ?? "", "utf-8");
-      if (firstLineBytes > MAX_OUTPUT_BYTES) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `[Line ${offset} is ${formatSize(firstLineBytes)}, exceeds ${formatSize(MAX_OUTPUT_BYTES)} limit. Use bash: sed -n '${offset}p' ${params.path} | head -c ${MAX_OUTPUT_BYTES}]`,
-            },
-          ],
-        };
-      }
-
-      const selectedLines = [];
-      let accumulatedBytes = 0;
-      let truncatedByBytes = false;
-
-      for (let i = startIdx; i < totalLines && selectedLines.length < maxRequestedLines; i++) {
-        const line = lines[i];
-        const lineBytes = Buffer.byteLength(line, "utf-8") + (selectedLines.length > 0 ? 1 : 0);
-        if (accumulatedBytes + lineBytes > MAX_OUTPUT_BYTES) {
-          truncatedByBytes = true;
-          break;
+      let outputText;
+      if (truncation.firstLineExceedsLimit) {
+        // First line alone exceeds the byte limit. Point the model at a bash fallback.
+        outputText = `[Line ${startLineDisplay} is ${formatSize(firstLineBytes)}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${params.path} | head -c ${DEFAULT_MAX_BYTES}]`;
+      } else if (truncation.truncated) {
+        // Truncation occurred. Build an actionable continuation notice.
+        const endLineDisplay = startLineDisplay + truncation.outputLines - 1;
+        const nextOffset = endLineDisplay + 1;
+        outputText = truncation.content;
+        if (truncation.truncatedBy === "lines") {
+          outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines}. Use offset=${nextOffset} to continue.]`;
+        } else {
+          outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
         }
-        selectedLines.push(line);
-        accumulatedBytes += lineBytes;
-      }
-
-      const endLineDisplay = offset + selectedLines.length - 1;
-      const nextOffset = endLineDisplay + 1;
-
-      let outputText = selectedLines.join("\n");
-      if (truncatedByBytes) {
-        outputText += `\n\n[Showing lines ${offset}-${endLineDisplay} of ${totalLines} (${formatSize(MAX_OUTPUT_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
-      } else if (endLineDisplay < totalLines) {
-        const remaining = totalLines - endLineDisplay;
-        outputText += `\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
+      } else if (userLimitedLines !== undefined && startLine + userLimitedLines < totalFileLines) {
+        // User-specified limit stopped early, but the file still has more content.
+        const remaining = totalFileLines - (startLine + userLimitedLines);
+        const nextOffset = startLine + userLimitedLines + 1;
+        outputText = `${truncation.content}\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
+      } else {
+        outputText = truncation.content;
       }
 
       return {
@@ -401,9 +398,15 @@ export const bashTool = {
           isError: true,
         };
       }
+      if (params.timeout * 1000 > MAX_TIMEOUT_MS) {
+        return {
+          content: [{ type: "text", text: `Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds` }],
+          isError: true,
+        };
+      }
     }
     const command = params.command;
-    const timeoutSec = params.timeout && params.timeout > 0 ? params.timeout : 0;
+    const timeoutSec = params.timeout ?? 0;
 
     if (!bashPath) {
       return {
@@ -420,10 +423,17 @@ export const bashTool = {
       };
     }
 
+    if (signal?.aborted) {
+      return { content: [{ type: "text", text: "Command aborted" }], isError: true };
+    }
+
     return new Promise((resolve) => {
-      let combinedOutput = "";
+      // Bounded memory: full output streams to a temp file once it outgrows the inline limits.
+      const output = new OutputBuffer({ tempFilePrefix: "pi-bash" });
       let timedOut = false;
+      let aborted = false;
       let timer = null;
+      let settled = false;
 
       const child = spawn(bashPath, ["-c", command], {
         cwd: process.cwd(),
@@ -443,6 +453,11 @@ export const bashTool = {
         }
       };
 
+      const onAbort = () => {
+        aborted = true;
+        killChild();
+      };
+
       if (timeoutSec > 0) {
         timer = setTimeout(() => {
           timedOut = true;
@@ -451,79 +466,93 @@ export const bashTool = {
       }
 
       if (signal) {
-        signal.addEventListener("abort", () => {
-          killChild();
-        }, { once: true });
+        signal.addEventListener("abort", onAbort, { once: true });
       }
 
       const onData = (data) => {
-        combinedOutput += data.toString("utf-8");
+        if (!settled) {
+          output.append(data);
+        }
       };
 
-      child.stdout.on("data", onData);
-      child.stderr.on("data", onData);
+      child.stdout?.on("data", onData);
+      child.stderr?.on("data", onData);
 
-      child.on("close", async (code) => {
-        if (timer) clearTimeout(timer);
-
-        let finalOutput = combinedOutput;
-        const lines = finalOutput.split(/\r?\n/);
-        const byteLen = Buffer.byteLength(finalOutput, "utf-8");
-
-        if (lines.length > MAX_OUTPUT_LINES || byteLen > MAX_OUTPUT_BYTES) {
-          const tmpFile = path.join(os.tmpdir(), `pi-bash-${Date.now().toString(36)}.log`);
-          await fs.writeFile(tmpFile, finalOutput, "utf-8").catch(() => {});
-
-          const truncatedLines = lines.slice(-MAX_OUTPUT_LINES);
-          let truncatedText = truncatedLines.join("\n");
-          if (Buffer.byteLength(truncatedText, "utf-8") > MAX_OUTPUT_BYTES) {
-            const buf = Buffer.from(truncatedText, "utf-8");
-            truncatedText = buf.subarray(buf.length - MAX_OUTPUT_BYTES).toString("utf-8");
-          }
-          finalOutput = `[Showing last ${truncatedLines.length} lines (${Math.round(MAX_OUTPUT_BYTES / 1024)}KB limit). Full output: ${tmpFile}]\n\n${truncatedText}`;
-        }
-
-        if (timedOut) {
-          resolve({
-            content: [
-              {
-                type: "text",
-                text: finalOutput
-                  ? `${finalOutput}\n\nCommand timed out after ${timeoutSec} seconds.`
-                  : `Command timed out after ${timeoutSec} seconds.`,
-              },
-            ],
-            isError: true,
-          });
+      const finish = async (statusText, emptyText, isError) => {
+        if (settled) {
           return;
         }
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
 
-        // code !== 0 includes code === null (terminated by signal/killed)
-        if (code !== 0) {
-          const exitMsg =
-            code === null
-              ? "Command terminated by signal without exit code"
-              : `Command exited with code ${code}`;
-          resolve({
-            content: [
-              {
-                type: "text",
-                text: finalOutput ? `${finalOutput}\n\n${exitMsg}` : exitMsg,
-              },
-            ],
-            isError: true,
-          });
+        output.finish();
+        const snapshot = output.snapshot();
+        const truncation = snapshot.truncation;
+        const lastLineBytes = output.getLastLineBytes();
+        await output.close().catch(() => {});
+
+        let text = snapshot.content || emptyText;
+        let details;
+        if (truncation.truncated) {
+          // `_meta` already carries the mirrored text, so leave the tail out of the truncation details.
+          const { content: _tail, ...truncationDetails } = truncation;
+          details = { truncation: truncationDetails, fullOutputPath: snapshot.fullOutputPath };
+          const startLine = truncation.totalLines - truncation.outputLines + 1;
+          const endLine = truncation.totalLines;
+          if (truncation.lastLinePartial) {
+            text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${formatSize(lastLineBytes)}). Full output: ${snapshot.fullOutputPath}]`;
+          } else if (truncation.truncatedBy === "lines") {
+            text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
+          } else {
+            text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+          }
+        }
+
+        // Same status joining as pi's appendStatus: no leading blank lines when there is no output.
+        const finalText = statusText ? (text ? `${text}\n\n${statusText}` : statusText) : text;
+        resolve({
+          content: [{ type: "text", text: finalText }],
+          ...(details ? { details } : {}),
+          isError,
+        });
+      };
+
+      child.on("close", async (code, signalName) => {
+        if (timedOut) {
+          await finish(`Command timed out after ${timeoutSec} seconds`, "", true);
+          return;
+        }
+        if (aborted) {
+          await finish("Command aborted", "", true);
+          return;
+        }
+        // A signal-killed shell has no exit code. Use the standard shell convention so callers
+        // do not mistake the termination for a successful command.
+        let resolvedCode = code;
+        if (resolvedCode === null && signalName) {
+          resolvedCode = 128 + (os.constants.signals[signalName] ?? 0);
+        }
+        if (resolvedCode === null) {
+          await finish("Command terminated without an exit code", "(no output)", true);
+        } else if (resolvedCode !== 0) {
+          await finish(`Command exited with code ${resolvedCode}`, "(no output)", true);
         } else {
-          resolve({
-            content: [{ type: "text", text: finalOutput || "(no output)" }],
-          });
+          await finish("", "(no output)", false);
         }
       });
 
-      child.on("error", (err) => {
+      child.on("error", async (err) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         if (timer) clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
+        output.finish();
+        await output.close().catch(() => {});
         resolve({
-          content: [{ type: "text", text: `Failed to execute command: ${err.message}` }],
+          content: [{ type: "text", text: err.message }],
           isError: true,
         });
       });
