@@ -29,6 +29,12 @@ import {
 } from "./utils/read-lines.js";
 import { detectSupportedImageMimeTypeFromFile } from "./utils/mime.js";
 import { OutputBuffer } from "./utils/output-buffer.js";
+import {
+  killProcessTree,
+  trackDetachedChildPid,
+  untrackDetachedChildPid,
+  waitForChildProcess,
+} from "./utils/child-process.js";
 
 export const MAX_OUTPUT_BYTES = DEFAULT_MAX_BYTES; // 50KB
 export const MAX_OUTPUT_LINES = DEFAULT_MAX_LINES;
@@ -515,30 +521,35 @@ export const bashTool = {
       const child = spawn(bashPath, ["-c", command], {
         cwd: process.cwd(),
         env: process.env,
+        // stdin must not be an open pipe: a command that reads it (`cat`, `read x`) would wait forever
+        // for an EOF nobody sends. pi waits on `exit` rather than `close` for the same reason.
+        stdio: ["ignore", "pipe", "pipe"],
+        // A process group of its own, so a kill reaches background children holding the output pipes.
+        detached: process.platform !== "win32",
         windowsHide: true,
       });
+      if (child.pid) trackDetachedChildPid(child.pid);
 
-      const killChild = () => {
-        if (process.platform === "win32") {
-          try {
-            spawn("taskkill", ["/pid", String(child.pid), "/f", "/t"], { windowsHide: true });
-          } catch {}
-        } else {
-          try {
-            child.kill("SIGKILL");
-          } catch {}
-        }
-      };
+      // The shell's own exit time, for the "background processes kept writing" note (pi#11613). Only the
+      // exit time known at the deadline counts: a shell killed by the timeout is not an early exit.
+      let shellExitedAfterMs;
+      let exitedBeforeDeadlineAfterMs;
+      child.once("exit", () => {
+        shellExitedAfterMs = performance.now() - startedAt;
+      });
 
       const onAbort = () => {
         aborted = true;
-        killChild();
+        if (child.pid) killProcessTree(child.pid);
       };
 
       if (timeoutSec > 0) {
         timer = setTimeout(() => {
           timedOut = true;
-          killChild();
+          exitedBeforeDeadlineAfterMs = shellExitedAfterMs;
+          // Also when the shell already exited: on Unix the group kill still reaches background
+          // processes holding the pipes. Windows cannot find them once the shell pid is gone.
+          if (child.pid) killProcessTree(child.pid);
         }, timeoutSec * 1000);
       }
 
@@ -562,6 +573,7 @@ export const bashTool = {
         settled = true;
         if (timer) clearTimeout(timer);
         if (signal) signal.removeEventListener("abort", onAbort);
+        if (child.pid) untrackDetachedChildPid(child.pid);
 
         output.finish();
         const snapshot = output.snapshot();
@@ -614,40 +626,56 @@ export const bashTool = {
         });
       };
 
-      child.on("close", async (code, signalName) => {
-        const wallTimeSeconds = Math.round((performance.now() - startedAt) / 100) / 10;
-        if (timedOut) {
-          await finish(`Command timed out after ${timeoutSec} seconds`, "", true);
+      // Wait for exit, then for the output pipes to fall idle: a descendant that inherited them must
+      // not hold the tool open, and one that keeps writing must not lose its tail.
+      (async () => {
+        let code;
+        try {
+          code = await waitForChildProcess(child);
+        } catch (err) {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          if (timer) clearTimeout(timer);
+          if (signal) signal.removeEventListener("abort", onAbort);
+          if (child.pid) untrackDetachedChildPid(child.pid);
+          output.finish();
+          await output.close().catch(() => {});
+          resolve({
+            content: [{ type: "text", text: err.message }],
+            isError: true,
+          });
           return;
         }
+
+        const wallTimeSeconds = Math.round((performance.now() - startedAt) / 100) / 10;
+        const signalName = child.signalCode;
+        // A signal-killed shell has no exit code. Use the standard shell convention so callers
+        // do not mistake the termination for a successful command.
+        const resolvedCode = code ?? (signalName ? 128 + (os.constants.signals[signalName] ?? 0) : 1);
+
+        // Like pi, an abort wins over a timeout that fired in the same instant.
         if (aborted) {
           await finish("Command aborted", "", true);
           return;
         }
-        // A signal-killed shell has no exit code. Use the standard shell convention so callers
-        // do not mistake the termination for a successful command.
-        const resolvedCode = code ?? (signalName ? 128 + (os.constants.signals[signalName] ?? 0) : 1);
+        if (timedOut) {
+          let status = `Command timed out after ${timeoutSec} seconds`;
+          if (exitedBeforeDeadlineAfterMs !== undefined) {
+            // Both facts matter: the command's real result, and that its background processes were
+            // still writing output when the timeout hit (pi#11613).
+            status += `. The shell exited with code ${resolvedCode} after ${Math.round(exitedBeforeDeadlineAfterMs / 100) / 10} seconds, but background processes it started kept writing output until the timeout.`;
+          }
+          await finish(status, "", true);
+          return;
+        }
         const isError = resolvedCode !== 0;
         await finish(isError ? `Command exited with code ${resolvedCode}` : "", "(no output)", isError, {
           exitCode: resolvedCode,
           wallTimeSeconds,
         });
-      });
-
-      child.on("error", async (err) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        if (timer) clearTimeout(timer);
-        if (signal) signal.removeEventListener("abort", onAbort);
-        output.finish();
-        await output.close().catch(() => {});
-        resolve({
-          content: [{ type: "text", text: err.message }],
-          isError: true,
-        });
-      });
+      })();
     });
   },
 };

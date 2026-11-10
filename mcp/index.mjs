@@ -5,6 +5,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { allTools, toCallToolResult, validateToolArguments } from "./tools.mjs";
+import { killTrackedDetachedChildren } from "./utils/child-process.js";
 
 export { allTools };
 
@@ -54,3 +55,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+// Bash children run in their own process group on Unix, so they would outlive this server. pi kills
+// its tracked detached children on shutdown for the same reason.
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, () => {
+    killTrackedDetachedChildren();
+    process.exit(0);
+  });
+}
+process.on("exit", () => {
+  killTrackedDetachedChildren();
+});
