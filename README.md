@@ -133,10 +133,10 @@ You can register `pi-soul` globally or per project:
   ```bash
   # Git Bash / Windows
   mkdir -p "$USERPROFILE/.gemini/antigravity/agents"
-  cp agents/pi-soul.md "$USERPROFILE/.gemini/antigravity/agents/pi-soul.md"
+  cp agents/pi-soul.md "$USERPROFILE/.gemini/antigravity/agents/agent.md"
   ```
 - **Project Setup**:
-  Place `agents/pi-soul.md` inside your repository's `.agents/agents/pi-soul.md`.
+  Place `agents/pi-soul.md` inside your repository's `.agents/agents/pi-soul/agent.md`.
 
 ---
 
@@ -155,7 +155,7 @@ agy --agent pi-soul --mode=auto
 
 Alternatively, launch `agy` and switch dynamically using the slash command:
 ```text
-/agent pi-soul
+/agents pi-soul
 ```
 
 ---
