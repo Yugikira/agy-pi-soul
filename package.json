@@ -1,0 +1,10 @@
+{
+  "name": "pi-soul-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "@earendil-works/pi-codemode": "^1.5.0",
+    "@earendil-works/pi-coding-agent": "^1.5.0",
+    "@modelcontextprotocol/sdk": "^1.32.2"
+  }
+}
