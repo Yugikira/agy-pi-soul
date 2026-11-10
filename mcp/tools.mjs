@@ -3,30 +3,76 @@ import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { formatSize } from "./utils/format.js";
-import { splitBom, normalizeToLF, applyReplacementsToOriginal } from "./utils/edit-diff.js";
+import {
+  splitBom,
+  normalizeToLF,
+  applyReplacementsToOriginal,
+  applyEditsToNormalizedContent,
+} from "./utils/edit-diff.js";
+import { resolvePath, normalizePath } from "./utils/paths.js";
 
 export const MAX_OUTPUT_BYTES = 50 * 1024; // 50KB
 export const MAX_OUTPUT_LINES = 2000;
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB
 
-export function resolvePath(targetPath) {
-  if (path.isAbsolute(targetPath)) return targetPath;
-  return path.resolve(process.cwd(), targetPath);
+export { resolvePath, normalizePath };
+
+function findExecutableOnPath(executable) {
+  if (process.platform === "win32") {
+    try {
+      const result = spawnSync("where", [executable], {
+        encoding: "utf-8",
+        timeout: 5000,
+        windowsHide: true,
+      });
+      if (result.status === 0 && result.stdout) {
+        const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
+        if (firstMatch && fsSync.existsSync(firstMatch)) {
+          return firstMatch;
+        }
+      }
+    } catch {}
+    return null;
+  }
+  try {
+    const result = spawnSync("which", [executable], { encoding: "utf-8", timeout: 5000 });
+    if (result.status === 0 && result.stdout) {
+      const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
+      if (firstMatch) return firstMatch;
+    }
+  } catch {}
+  return null;
 }
 
 export function findBash() {
-  if (process.platform !== "win32") return "bash";
-  const candidates = [
-    "C:\\Program Files\\Git\\bin\\bash.exe",
-    "C:\\Program Files\\Git\\usr\\bin\\bash.exe",
-    "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
-    path.join(process.env.LOCALAPPDATA || "", "Programs\\Git\\bin\\bash.exe"),
-  ];
-  for (const candidate of candidates) {
-    if (fsSync.existsSync(candidate)) return candidate;
+  if (process.platform !== "win32") {
+    if (fsSync.existsSync("/bin/bash")) return "/bin/bash";
+    const bashOnPath = findExecutableOnPath("bash");
+    if (bashOnPath) return bashOnPath;
+    return "sh";
   }
-  return "bash.exe";
+  const paths = [];
+  const programFiles = process.env.ProgramFiles;
+  if (programFiles) {
+    paths.push(`${programFiles}\\Git\\bin\\bash.exe`);
+    paths.push(`${programFiles}\\Git\\usr\\bin\\bash.exe`);
+  }
+  const programFilesX86 = process.env["ProgramFiles(x86)"];
+  if (programFilesX86) {
+    paths.push(`${programFilesX86}\\Git\\bin\\bash.exe`);
+  }
+  if (process.env.LOCALAPPDATA) {
+    paths.push(path.join(process.env.LOCALAPPDATA, "Programs\\Git\\bin\\bash.exe"));
+  }
+  for (const p of paths) {
+    if (fsSync.existsSync(p)) return p;
+  }
+  const bashOnPath = findExecutableOnPath("bash.exe");
+  if (bashOnPath) return bashOnPath;
+
+  return null;
 }
 
 export const bashPath = findBash();
@@ -78,9 +124,24 @@ export const readTool = {
       };
 
       if (imageMimeTypes[ext]) {
+        if (stat.size > MAX_IMAGE_BYTES) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Image file ${params.path} (${formatSize(stat.size)}) exceeds the ${formatSize(MAX_IMAGE_BYTES)} limit. Please resize or inspect it using bash/scripts.`,
+              },
+            ],
+            isError: true,
+          };
+        }
         const buffer = await fs.readFile(fullPath);
         return {
           content: [
+            {
+              type: "text",
+              text: `Read image file [${imageMimeTypes[ext]}]`,
+            },
             {
               type: "image",
               data: buffer.toString("base64"),
@@ -203,7 +264,7 @@ export const writeTool = {
   },
 };
 
-// 3. edit tool (CRLF preservation + flexible input parsing)
+// 3. edit tool (CRLF preservation + fuzzy match + flexible input parsing)
 export const editTool = {
   name: "edit",
   description:
@@ -277,94 +338,16 @@ export const editTool = {
       const { bom, text: content } = splitBom(rawContent);
       const normalizedOriginal = normalizeToLF(content);
 
-      // Normalize all edits to LF for matching
-      const normalizedEdits = edits.map((e) => ({
-        oldText: normalizeToLF(String(e.oldText ?? "")),
-        newText: normalizeToLF(String(e.newText ?? "")),
-      }));
-
-      // Locate all replacements in normalized original
-      const occurrences = [];
-      for (let i = 0; i < normalizedEdits.length; i++) {
-        const { oldText, newText } = normalizedEdits[i];
-        if (!oldText) {
-          return {
-            content: [{ type: "text", text: `Error in edit[${i}]: 'oldText' cannot be empty.` }],
-            isError: true,
-          };
-        }
-
-        let count = 0;
-        let pos = 0;
-        let firstIndex = -1;
-        while ((pos = normalizedOriginal.indexOf(oldText, pos)) !== -1) {
-          count++;
-          if (firstIndex === -1) firstIndex = pos;
-          pos += oldText.length;
-        }
-
-        if (count === 0) {
-          return {
-            content: [{ type: "text", text: `Error: Could not find exact match for 'oldText' in ${params.path}:\n${oldText}` }],
-            isError: true,
-          };
-        }
-        if (count > 1) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: 'oldText' matched ${count} times in ${params.path}. Please provide more surrounding context to disambiguate:\n${oldText}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-
-        occurrences.push({
-          matchIndex: firstIndex,
-          matchLength: oldText.length,
-          newText,
-          order: i,
-        });
-      }
-
-      // Sort by index to check for overlaps
-      occurrences.sort((a, b) => a.matchIndex - b.matchIndex);
-      for (let i = 0; i < occurrences.length - 1; i++) {
-        const cur = occurrences[i];
-        const next = occurrences[i + 1];
-        if (cur.matchIndex + cur.matchLength > next.matchIndex) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Error: Overlapping edits detected between edit[${cur.order}] and edit[${next.order}]. Merge nearby edits into a single block.`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      }
-
-      // Apply replacements backwards in LF space to check for no-op
-      let modifiedLF = normalizedOriginal;
-      for (let i = occurrences.length - 1; i >= 0; i--) {
-        const { matchIndex, matchLength, newText } = occurrences[i];
-        modifiedLF = modifiedLF.slice(0, matchIndex) + newText + modifiedLF.slice(matchIndex + matchLength);
-      }
-
-      if (modifiedLF === normalizedOriginal) {
-        return {
-          content: [{ type: "text", text: `Error: Replacement produced identical content for ${params.path}. No changes made.` }],
-          isError: true,
-        };
-      }
+      const { newContent, replacements } = applyEditsToNormalizedContent(
+        normalizedOriginal,
+        edits,
+        params.path
+      );
 
       // Restore line endings: untouched lines keep original line endings
       const finalContent = bom + (content === normalizedOriginal
-        ? modifiedLF
-        : applyReplacementsToOriginal(content, occurrences));
+        ? newContent
+        : applyReplacementsToOriginal(content, replacements));
 
       await fs.writeFile(fullPath, finalContent, "utf-8");
       return {
@@ -401,8 +384,31 @@ export const bashTool = {
     },
   },
   async execute(_id, params, signal) {
+    if (params.timeout !== undefined) {
+      if (typeof params.timeout !== "number" || !Number.isFinite(params.timeout) || params.timeout <= 0) {
+        return {
+          content: [{ type: "text", text: "Invalid timeout: must be a finite number of seconds" }],
+          isError: true,
+        };
+      }
+    }
     const command = params.command;
     const timeoutSec = params.timeout && params.timeout > 0 ? params.timeout : 0;
+
+    if (!bashPath) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "No bash shell found. Options:\n" +
+              "  1. Install Git for Windows: https://git-scm.com/download/win\n" +
+              "  2. Add your bash to PATH (Cygwin, MSYS2, etc.)",
+          },
+        ],
+        isError: true,
+      };
+    }
 
     return new Promise((resolve) => {
       let combinedOutput = "";
