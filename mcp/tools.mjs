@@ -10,14 +10,16 @@ import {
   normalizeToLF,
   applyReplacementsToOriginal,
   applyEditsToNormalizedContent,
+  generateUnifiedPatch,
 } from "./utils/edit-diff.js";
 import { resolvePath, normalizePath } from "./utils/paths.js";
+import { withFileMutationQueue } from "./utils/mutation-queue.js";
 
 export const MAX_OUTPUT_BYTES = 50 * 1024; // 50KB
 export const MAX_OUTPUT_LINES = 2000;
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB
 
-export { resolvePath, normalizePath };
+export { resolvePath, normalizePath, withFileMutationQueue };
 
 function findExecutableOnPath(executable) {
   if (process.platform === "win32") {
@@ -77,7 +79,7 @@ export function findBash() {
 
 export const bashPath = findBash();
 
-// 1. read tool (with byte and line limit + out-of-bounds error handling)
+// 1. read tool (with byte and line limit + CRLF preservation + out-of-bounds error handling)
 export const readTool = {
   name: "read",
   description:
@@ -151,9 +153,9 @@ export const readTool = {
         };
       }
 
-      // Read text file
+      // Read text file (splitting on \n preserves \r on CRLF files)
       const raw = await fs.readFile(fullPath, "utf-8");
-      const lines = raw.split(/\r?\n/);
+      const lines = raw.split("\n");
       const totalLines = lines.length;
 
       const offset = params.offset && params.offset > 0 ? Math.floor(params.offset) : 1;
@@ -223,7 +225,7 @@ export const readTool = {
   },
 };
 
-// 2. write tool
+// 2. write tool (with mutation queue & aligned phrasing)
 export const writeTool = {
   name: "write",
   description:
@@ -244,27 +246,29 @@ export const writeTool = {
   },
   async execute(_id, params) {
     const fullPath = resolvePath(params.path);
-    try {
-      await fs.mkdir(path.dirname(fullPath), { recursive: true });
-      await fs.writeFile(fullPath, params.content, "utf-8");
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Successfully wrote ${Buffer.byteLength(params.content, "utf-8")} bytes to ${params.path}`,
-          },
-        ],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: "text", text: `Error writing file: ${err.message}` }],
-        isError: true,
-      };
-    }
+    return withFileMutationQueue(fullPath, async () => {
+      try {
+        await fs.mkdir(path.dirname(fullPath), { recursive: true });
+        await fs.writeFile(fullPath, params.content, "utf-8");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Successfully wrote to ${params.path}`,
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error writing file: ${err.message}` }],
+          isError: true,
+        };
+      }
+    });
   },
 };
 
-// 3. edit tool (CRLF preservation + fuzzy match + flexible input parsing)
+// 3. edit tool (CRLF preservation + fuzzy match + diff + mutation queue)
 export const editTool = {
   name: "edit",
   description:
@@ -310,55 +314,60 @@ export const editTool = {
   },
   async execute(_id, params) {
     const fullPath = resolvePath(params.path);
-    try {
-      let edits = params.edits;
-      if (typeof edits === "string") {
-        try {
-          edits = JSON.parse(edits);
-        } catch {}
-      }
-      if (edits && typeof edits === "object" && !Array.isArray(edits)) {
-        if (typeof edits.oldText === "string" && typeof edits.newText === "string") {
-          edits = [edits];
+    return withFileMutationQueue(fullPath, async () => {
+      try {
+        let edits = params.edits;
+        if (typeof edits === "string") {
+          try {
+            edits = JSON.parse(edits);
+          } catch {}
         }
-      }
-      edits = Array.isArray(edits) ? [...edits] : [];
-      if (typeof params.oldText === "string" && typeof params.newText === "string") {
-        edits.push({ oldText: params.oldText, newText: params.newText });
-      }
+        if (edits && typeof edits === "object" && !Array.isArray(edits)) {
+          if (typeof edits.oldText === "string" && typeof edits.newText === "string") {
+            edits = [edits];
+          }
+        }
+        edits = Array.isArray(edits) ? [...edits] : [];
+        if (typeof params.oldText === "string" && typeof params.newText === "string") {
+          edits.push({ oldText: params.oldText, newText: params.newText });
+        }
 
-      if (edits.length === 0) {
+        if (edits.length === 0) {
+          return {
+            content: [{ type: "text", text: "Error: Either 'edits' array or 'oldText'/'newText' must be provided." }],
+            isError: true,
+          };
+        }
+
+        const rawContent = await fs.readFile(fullPath, "utf-8");
+        const { bom, text: content } = splitBom(rawContent);
+        const normalizedOriginal = normalizeToLF(content);
+
+        const { newContent, replacements } = applyEditsToNormalizedContent(
+          normalizedOriginal,
+          edits,
+          params.path
+        );
+
+        // Restore line endings: untouched lines keep original line endings
+        const finalContent = bom + (content === normalizedOriginal
+          ? newContent
+          : applyReplacementsToOriginal(content, replacements));
+
+        const editDiff = generateUnifiedPatch(params.path, rawContent, finalContent);
+
+        await fs.writeFile(fullPath, finalContent, "utf-8");
         return {
-          content: [{ type: "text", text: "Error: Either 'edits' array or 'oldText'/'newText' must be provided." }],
+          content: [{ type: "text", text: `Successfully replaced ${edits.length} block(s) in ${params.path}.` }],
+          details: { diff: editDiff },
+        };
+      } catch (err) {
+        return {
+          content: [{ type: "text", text: `Error editing file: ${err.message}` }],
           isError: true,
         };
       }
-
-      const rawContent = await fs.readFile(fullPath, "utf-8");
-      const { bom, text: content } = splitBom(rawContent);
-      const normalizedOriginal = normalizeToLF(content);
-
-      const { newContent, replacements } = applyEditsToNormalizedContent(
-        normalizedOriginal,
-        edits,
-        params.path
-      );
-
-      // Restore line endings: untouched lines keep original line endings
-      const finalContent = bom + (content === normalizedOriginal
-        ? newContent
-        : applyReplacementsToOriginal(content, replacements));
-
-      await fs.writeFile(fullPath, finalContent, "utf-8");
-      return {
-        content: [{ type: "text", text: `Successfully applied ${edits.length} edit(s) to ${params.path}` }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: "text", text: `Error editing file: ${err.message}` }],
-        isError: true,
-      };
-    }
+    });
   },
 };
 
@@ -505,7 +514,7 @@ export const bashTool = {
           });
         } else {
           resolve({
-            content: [{ type: "text", text: finalOutput || "(Command executed with no output)" }],
+            content: [{ type: "text", text: finalOutput || "(no output)" }],
           });
         }
       });
@@ -528,14 +537,24 @@ export const piTools = {
   bash: bashTool,
 };
 
-export function extractTextResult(res) {
+export function extractCodemodeResult(res) {
   if (!res || !Array.isArray(res.content)) return typeof res === "string" ? res : JSON.stringify(res);
+  const imageItem = res.content.find((c) => c.type === "image");
+  if (imageItem) {
+    const textItem = res.content.find((c) => c.type === "text");
+    return {
+      type: "image",
+      data: imageItem.data,
+      mimeType: imageItem.mimeType,
+      note: textItem ? textItem.text : "",
+    };
+  }
   return res.content
     .map((c) => (c.type === "text" ? c.text : `[${c.type}]`))
     .join("\n");
 }
 
-// 5. codemode tool (with proper subtool error throwing)
+// 5. codemode tool (with inputSchema + proper subtool error throwing + image support)
 export const codemodeTool = {
   name: "codemode",
   description:
@@ -561,13 +580,14 @@ export const codemodeTool = {
       tools: Object.values(piTools).map((t) => ({
         name: t.name,
         description: t.description,
+        inputSchema: t.parameters,
         execute: async (args, { signal: sbSignal }) => {
           const res = await t.execute("codemode-subcall", args, sbSignal ?? signal);
-          const text = extractTextResult(res);
+          const val = extractCodemodeResult(res);
           if (res && res.isError) {
-            throw new Error(text);
+            throw new Error(typeof val === "string" ? val : JSON.stringify(val));
           }
-          return text;
+          return val;
         },
       })),
     });

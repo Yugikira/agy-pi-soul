@@ -1,3 +1,12 @@
+import * as Diff from "diff";
+
+export function generateUnifiedPatch(filePath, oldContent, newContent, contextLines = 4) {
+  return Diff.createTwoFilesPatch(filePath, filePath, oldContent, newContent, undefined, undefined, {
+    context: contextLines,
+    headerOptions: Diff.FILE_HEADERS_ONLY,
+  });
+}
+
 export function splitBom(text) {
   if (text.startsWith("\uFEFF")) {
     return { bom: "\uFEFF", text: text.slice(1) };
