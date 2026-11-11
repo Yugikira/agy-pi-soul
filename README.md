@@ -61,8 +61,8 @@ Many developers love Pi's CLI experience and have attempted to wrap `agy` as a h
 ### 1. Minimalist System Prompt (`excludeDefaultComponents: true`)
 Leveraging configuration techniques uncovered from the Hermes `antigravity-agy` plugin ecosystem, `excludeDefaultComponents: true` completely purges `agy`'s verbose built-in prompt, rules, and PowerShell directives, returning full reasoning autonomy to the Gemini model.
 
-### 2. Pi's Essential Five Tools (Zero-Delay Eager Loaded)
-Through the local stdio MCP server (`mcp/index.mjs`), Pi's battle-tested primitives are exposed directly into the top-level tool list with `_meta: { "antigravity/alwaysLoad": true }` and `eager: true`:
+### 2. Pi's Essential Five Tools (Loaded into the Top-Level Tool List)
+Through the local stdio MCP server (`mcp/index.mjs`), Pi's battle-tested primitives are exposed directly into the top-level tool list with `_meta: { "antigravity/alwaysLoad": true }` and `eager: true` (inline `eager` does not preload the server itself — see *Recommended usage: preload the MCP server* under Installation below):
 - `bash`: Runs inside Git Bash (`C:\Program Files\Git\bin\bash.exe`). No PowerShell quirks, full POSIX pipeline support.
 - `read`: Read files cleanly with optional start line and limit.
 - `write`: Create or overwrite files cleanly.
@@ -134,6 +134,74 @@ mcpServers:
     eager: true
 ```
 > **Tip**: Replace the path with the absolute path to your `mcp/index.mjs`.
+> **Note**: declaring the server here is *not* enough to have it loaded before the first message — see the
+> recommended setup right below.
+
+#### ✅ Recommended usage: preload the MCP server (`inheritMcp: true`)
+
+**Recommended setup for real sessions** — verified end-to-end on a second machine, not just by handshake probes.
+
+Inline `mcpServers` (even with `eager: true`) is **not** silently loaded while the session boots.
+`agy` spawns that server when the first user message is sent, so on a cold session the model sees an
+empty or partial tool list on turn 1 and may claim the `pisoul` tools are not registered — the original
+symptom that motivated this project. Preloading fixes it at the root:
+
+1. Register `pisoul` in agy's **global** MCP config, so it is started at session boot:
+   ```bash
+   agy mcp add pisoul node "D:/claude/agy-agents/pi-soul/mcp/index.mjs"
+   agy mcp list   # should list: pisoul  stdio  enabled
+   ```
+   Then set `"eager": true` on that entry in `~/.gemini/config/mcp_config.json`:
+   ```json
+   {
+     "mcpServers": {
+       "pisoul": {
+         "command": "node",
+         "args": ["D:/claude/agy-agents/pi-soul/mcp/index.mjs"],
+         "disabled": false,
+         "eager": true
+       }
+     }
+   }
+   ```
+   (`mcp/index.mjs` additionally marks every tool with `_meta: { "antigravity/alwaysLoad": true }`, which is
+   the documented way to force a tool into the top-level tool list.)
+2. Set `inheritMcp: true` in the agent frontmatter and **remove** the inline `mcpServers` block, so the
+   server is not defined twice.
+
+```yaml
+---
+name: pi-soul
+description: "Pi Coding Agent soul inside Antigravity body"
+mainAgent: true
+subagent: true
+excludeDefaultComponents: true
+inheritCustomizations: true
+inheritMcp: true        # ← preload every globally registered MCP server (pisoul included)
+# mcpServers: <-- drop this block; pisoul now comes from the global MCP config
+tools:
+  - read_file
+  - search_web
+  - generate_image
+  - invoke_subagent
+  - define_subagent
+  - manage_subagents
+  - send_message
+  - ask_question
+---
+```
+
+**Trade-off**: `inheritMcp: true` inherits *every* globally registered MCP server, so unrelated servers
+(e.g. `chrome-devtools`, `context7`) also land in the context window and cost tokens. For pi-soul this is
+the lesser evil: without preloading the very first turn of every cold session starts with the `pisoul`
+tools missing, which is far more damaging than a few extra tool declarations. Keep global registrations
+to a minimum and disable the ones you do not need (`agy mcp disable <name>`).
+
+> Repo vs. your setup: the tracked `agents/pi-soul.md` intentionally still declares the server *inline*
+> (`inheritMcp: false`), and `mcp/` is unchanged — switching this repo over is deferred (see
+> [docs/issues_pi-native-tools-revert.md](./docs/issues_pi-native-tools-revert.md)). When applying the
+> recommendation, edit your **installed** copy, i.e. `~/.gemini/config/agents/pi-soul/agent.md`; do not
+> forget to re-apply after updating the repo copy.
 
 ### Step 3: Register Agent with Antigravity CLI
 You can register `pi-soul` globally or per project:
@@ -142,9 +210,10 @@ You can register `pi-soul` globally or per project:
   Copy or symlink `agents/pi-soul.md` into your user agent directory:
   ```bash
   # Git Bash / Windows
-  mkdir -p "$USERPROFILE/.gemini/antigravity/agents"
-  cp agents/pi-soul.md "$USERPROFILE/.gemini/antigravity/agents/agent.md"
+  mkdir -p "$USERPROFILE/.gemini/config/agents/pi-soul"
+  cp agents/pi-soul.md "$USERPROFILE/.gemini/config/agents/pi-soul/agent.md"
   ```
+  Verify with `agy agents` (the agent must show up as `pi-soul`).
 - **Project Setup**:
   Place `agents/pi-soul.md` inside your repository's `.agents/agents/pi-soul/agent.md`.
 
